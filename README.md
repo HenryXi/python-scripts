@@ -6,6 +6,7 @@
 
 | 脚本名称 | 功能说明 |
 | -------- | -------- |
+| [bilibili_downloader.py](scripts/bilibili_downloader.py) | 下载 B 站 UP 主的所有视频，支持画质选择 |
 
 ## 使用说明
 
