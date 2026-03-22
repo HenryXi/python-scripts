@@ -6,9 +6,9 @@ B站 UP 主视频批量下载脚本（纯 Python 实现）
     python bilibili_downloader.py <UP主UID> [选项]
 
 示例:
-    python bilibili_downloader.py 12345678
-    python bilibili_downloader.py 12345678 --quality 1080p
     python bilibili_downloader.py 12345678 --cookies cookies.txt
+    python bilibili_downloader.py 12345678 --cookies cookies.txt --quality 1080p
+    python bilibili_downloader.py 12345678 --cookies cookies.txt --concurrency 5
 """
 
 import argparse
@@ -22,8 +22,10 @@ import subprocess
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import reduce
 from pathlib import Path
+from threading import Lock
 
 # 跳过 SSL 证书验证
 ssl_ctx = ssl.create_default_context()
@@ -47,8 +49,17 @@ _MIXIN_KEY_ENC_TAB = [
     22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
 ]
 
+print_lock = Lock()
+
+
+def log(msg):
+    with print_lock:
+        print(msg)
+
+
 def _get_mixin_key(orig):
     return reduce(lambda s, i: s + orig[i], _MIXIN_KEY_ENC_TAB, '')[:32]
+
 
 def get_wbi_key(cookies):
     """从 nav 接口获取 WBI 签名所需的 mixin_key"""
@@ -61,6 +72,7 @@ def get_wbi_key(cookies):
     img_key = wbi["img_url"].split("/")[-1].split(".")[0]
     sub_key = wbi["sub_url"].split("/")[-1].split(".")[0]
     return _get_mixin_key(img_key + sub_key)
+
 
 def wbi_sign(params, mixin_key):
     """对请求参数进行 WBI 签名"""
@@ -79,12 +91,22 @@ def check_ffmpeg():
         sys.exit(1)
 
 
+def clean_tmp(tmp_dir):
+    """清理未完成的下载临时文件"""
+    if not os.path.exists(tmp_dir):
+        return
+    files = list(Path(tmp_dir).glob("*.m4s")) + list(Path(tmp_dir).glob("*.flv"))
+    if files:
+        print(f"清理 {len(files)} 个未完成的临时文件...")
+        for f in files:
+            f.unlink()
+
+
 def load_cookies(cookies_file):
     """加载 cookies 文件（Netscape 格式）或直接返回 cookies 字符串"""
     if not cookies_file:
         return ""
 
-    # 如果是文件路径
     if os.path.exists(cookies_file):
         cookies = []
         with open(cookies_file) as f:
@@ -97,10 +119,8 @@ def load_cookies(cookies_file):
                     cookies.append(f"{parts[5]}={parts[6]}")
         return "; ".join(cookies)
 
-    # 如果直接是 SESSDATA 值，构造 cookie 字符串
     if not cookies_file.startswith("SESSDATA="):
         cookies_file = f"SESSDATA={cookies_file}"
-
     return cookies_file
 
 
@@ -124,7 +144,6 @@ def get_all_videos(mid, cookies=""):
     """获取 UP 主所有视频列表（使用 WBI 签名）"""
     print(f"正在获取 UP 主 {mid} 的视频列表...")
 
-    # 获取 WBI 签名 key
     try:
         mixin_key = get_wbi_key(cookies)
     except Exception as e:
@@ -175,7 +194,6 @@ def get_all_videos(mid, cookies=""):
 
 def get_video_playurl(bvid, quality, cookies=""):
     """获取视频播放地址"""
-    # 先获取 cid
     url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
     headers = HEADERS.copy()
     if cookies:
@@ -190,10 +208,9 @@ def get_video_playurl(bvid, quality, cookies=""):
         cid = data["data"]["cid"]
         title = data["data"]["title"]
     except Exception as e:
-        print(f"  获取视频信息失败: {e}")
+        log(f"  获取视频信息失败: {e}")
         return None
 
-    # 获取播放地址
     qn_map = {"best": 127, "1080p": 80, "720p": 64, "480p": 32}
     qn = qn_map.get(quality, 127)
 
@@ -208,14 +225,14 @@ def get_video_playurl(bvid, quality, cookies=""):
         durl = data["data"].get("durl")
         dash = data["data"].get("dash")
 
-        if dash:  # DASH 格式（音视频分离）
+        if dash:
             video_url = dash["video"][0]["baseUrl"] if dash.get("video") else None
             audio_url = dash["audio"][0]["baseUrl"] if dash.get("audio") else None
             return {"title": title, "video": video_url, "audio": audio_url, "type": "dash"}
-        elif durl:  # FLV 格式（音视频合一）
+        elif durl:
             return {"title": title, "url": durl[0]["url"], "type": "flv"}
     except Exception as e:
-        print(f"  获取播放地址失败: {e}")
+        log(f"  获取播放地址失败: {e}")
 
     return None
 
@@ -227,27 +244,20 @@ def download_file(url, output_path, cookies=""):
         headers["Cookie"] = cookies
 
     req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
-            total_size = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            chunk_size = 1024 * 1024  # 1MB
+    with urllib.request.urlopen(req, timeout=60, context=ssl_ctx) as resp:
+        total_size = int(resp.headers.get("Content-Length", 0))
+        downloaded = 0
+        chunk_size = 1024 * 1024  # 1MB
 
-            with open(output_path, "wb") as f:
-                while True:
-                    chunk = resp.read(chunk_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        percent = downloaded * 100 / total_size
-                        print(f"\r    下载进度: {percent:.1f}%", end="", flush=True)
-            print()
-        return True
-    except Exception as e:
-        print(f"\n    下载失败: {e}")
-        return False
+        with open(output_path, "wb") as f:
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+
+    return True
 
 
 def merge_video_audio(video_path, audio_path, output_path):
@@ -269,54 +279,48 @@ def sanitize_filename(name):
     return re.sub(r'[\\/:*?"<>|]', "_", name)
 
 
-def download_video(bvid, title, output_dir, quality, cookies):
-    """下载单个视频"""
+def download_video(bvid, title, index, total, output_dir, quality, cookies):
+    """下载单个视频（线程安全）"""
     safe_title = sanitize_filename(title)
     output_path = os.path.join(output_dir, f"{safe_title}.mp4")
 
     if os.path.exists(output_path):
-        print(f"  已存在，跳过: {safe_title}")
+        log(f"[{index}/{total}] 已存在，跳过: {safe_title}")
         return True
+
+    log(f"[{index}/{total}] 开始下载: {title}")
 
     play_info = get_video_playurl(bvid, quality, cookies)
     if not play_info:
-        print(f"  无法获取播放地址，跳过")
+        log(f"[{index}/{total}] 失败: 无法获取播放地址 - {title}")
         return False
 
     tmp_dir = os.path.join(output_dir, ".tmp")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    if play_info["type"] == "dash":
-        video_path = os.path.join(tmp_dir, f"{bvid}_video.m4s")
-        audio_path = os.path.join(tmp_dir, f"{bvid}_audio.m4s")
+    try:
+        if play_info["type"] == "dash":
+            video_path = os.path.join(tmp_dir, f"{bvid}_video.m4s")
+            audio_path = os.path.join(tmp_dir, f"{bvid}_audio.m4s")
 
-        print(f"  下载视频流...")
-        ok = download_file(play_info["video"], video_path, cookies)
-        if not ok:
-            return False
+            download_file(play_info["video"], video_path, cookies)
+            download_file(play_info["audio"], audio_path, cookies)
 
-        print(f"  下载音频流...")
-        ok = download_file(play_info["audio"], audio_path, cookies)
-        if not ok:
-            return False
+            ok = merge_video_audio(video_path, audio_path, output_path)
+            os.remove(video_path)
+            os.remove(audio_path)
 
-        print(f"  合并音视频...")
-        ok = merge_video_audio(video_path, audio_path, output_path)
+            if not ok:
+                log(f"[{index}/{total}] 失败: 音视频合并失败 - {title}")
+                return False
+        else:
+            download_file(play_info["url"], output_path, cookies)
 
-        os.remove(video_path)
-        os.remove(audio_path)
+    except Exception as e:
+        log(f"[{index}/{total}] 失败: {e} - {title}")
+        return False
 
-        if not ok:
-            print(f"  合并失败")
-            return False
-
-    else:  # flv 格式直接下载
-        print(f"  下载视频...")
-        ok = download_file(play_info["url"], output_path, cookies)
-        if not ok:
-            return False
-
-    print(f"  完成: {safe_title}.mp4")
+    log(f"[{index}/{total}] 完成: {safe_title}.mp4")
     return True
 
 
@@ -339,10 +343,10 @@ def main():
         help="cookies 文件路径（Netscape 格式）或直接传入 SESSDATA 值",
     )
     parser.add_argument(
-        "--wait",
+        "--concurrency", "-n",
         type=int,
-        default=1,
-        help="请求间隔秒数（默认: 1，如遇限流可增加到 2-3）",
+        default=3,
+        help="并发下载数量（默认: 3）",
     )
 
     args = parser.parse_args()
@@ -364,8 +368,13 @@ def main():
         print(f"UID: {args.mid}（无法获取用户信息，继续下载）")
 
     os.makedirs(output_dir, exist_ok=True)
+
+    # 启动时清理未完成的临时文件
+    clean_tmp(os.path.join(output_dir, ".tmp"))
+
     print(f"下载目录: {output_dir}")
     print(f"目标画质: {args.quality}")
+    print(f"并发数量: {args.concurrency}")
 
     # 获取所有视频
     videos = get_all_videos(args.mid, cookies)
@@ -373,23 +382,28 @@ def main():
         print("未找到任何视频，退出")
         sys.exit(0)
 
-    print(f"\n共找到 {len(videos)} 个视频，开始下载...")
+    total = len(videos)
+    print(f"\n共找到 {total} 个视频，开始下载...")
     print("-" * 50)
 
     success = 0
     failed = 0
-    for i, video in enumerate(videos, 1):
-        bvid = video["bvid"]
-        title = video["title"]
-        print(f"\n[{i}/{len(videos)}] {title}")
 
-        ok = download_video(bvid, title, output_dir, args.quality, cookies)
-        if ok:
-            success += 1
-        else:
-            failed += 1
+    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+        futures = {
+            executor.submit(
+                download_video,
+                video["bvid"], video["title"], i, total,
+                output_dir, args.quality, cookies
+            ): video
+            for i, video in enumerate(videos, 1)
+        }
 
-        time.sleep(1)  # 避免请求过快
+        for future in as_completed(futures):
+            if future.result():
+                success += 1
+            else:
+                failed += 1
 
     print("\n" + "=" * 50)
     print(f"下载完成: 成功 {success} 个，失败 {failed} 个")
