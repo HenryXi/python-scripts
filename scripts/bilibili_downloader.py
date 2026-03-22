@@ -1,47 +1,71 @@
 #!/usr/bin/env python3
 """
-B站 UP 主视频批量下载脚本
+B站 UP 主视频批量下载脚本（纯 Python 实现）
 
 用法:
     python bilibili_downloader.py <UP主UID> [选项]
 
 示例:
     python bilibili_downloader.py 12345678
-    python bilibili_downloader.py 12345678 --output ~/Videos/bilibili
     python bilibili_downloader.py 12345678 --quality 1080p
+    python bilibili_downloader.py 12345678 --cookies cookies.txt
 """
 
 import argparse
 import json
 import os
+import re
+import shutil
+import ssl
 import subprocess
 import sys
 import time
 import urllib.request
-import urllib.parse
+from pathlib import Path
+
+# 跳过 SSL 证书验证
+ssl_ctx = ssl.create_default_context()
+ssl_ctx.check_hostname = False
+ssl_ctx.verify_mode = ssl.CERT_NONE
+
+# 请求头
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Referer": "https://www.bilibili.com",
+}
 
 
-def check_yt_dlp():
-    """检查 yt-dlp 是否已安装"""
-    try:
-        subprocess.run(["yt-dlp", "--version"], capture_output=True, check=True)
-    except FileNotFoundError:
-        print("错误: 未找到 yt-dlp，请先安装：")
-        print("  pip install yt-dlp")
-        print("  或: brew install yt-dlp")
+def check_ffmpeg():
+    """检查 ffmpeg 是否已安装"""
+    if not shutil.which("ffmpeg"):
+        print("错误: 未找到 ffmpeg，请先安装：")
+        print("  brew install ffmpeg")
         sys.exit(1)
 
 
-def get_user_info(mid: str) -> dict:
+def load_cookies(cookies_file):
+    """加载 cookies 文件（Netscape 格式）"""
+    if not cookies_file or not os.path.exists(cookies_file):
+        return ""
+
+    cookies = []
+    with open(cookies_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                cookies.append(f"{parts[5]}={parts[6]}")
+    return "; ".join(cookies)
+
+
+def get_user_info(mid):
     """获取 UP 主基本信息"""
     url = f"https://api.bilibili.com/x/space/wbi/acc/info?mid={mid}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Referer": "https://www.bilibili.com",
-    }
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.request.Request(url, headers=HEADERS)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
             data = json.loads(resp.read().decode())
         if data.get("code") == 0:
             return data["data"]
@@ -50,97 +74,192 @@ def get_user_info(mid: str) -> dict:
     return {}
 
 
-def get_all_video_bvids(mid: str) -> list[str]:
-    """获取 UP 主所有视频的 BV 号"""
-    bvids = []
-    page = 1
-    page_size = 50
-
+def get_all_videos(mid, cookies=""):
+    """获取 UP 主所有视频列表"""
     print(f"正在获取 UP 主 {mid} 的视频列表...")
 
+    videos = []
+    page = 1
+    page_size = 30
+
+    headers = HEADERS.copy()
+    if cookies:
+        headers["Cookie"] = cookies
+
     while True:
-        url = (
-            f"https://api.bilibili.com/x/space/arc/search"
-            f"?mid={mid}&pn={page}&ps={page_size}&tid=0&keyword=&order=pubdate"
-        )
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Referer": f"https://space.bilibili.com/{mid}",
-        }
+        url = f"https://api.bilibili.com/x/space/wbi/arc/search?mid={mid}&pn={page}&ps={page_size}"
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
                 data = json.loads(resp.read().decode())
+
+            if data.get("code") != 0:
+                break
+
+            vlist = data["data"]["list"]["vlist"]
+            if not vlist:
+                break
+
+            videos.extend(vlist)
+            print(f"  已获取 {len(videos)} 个视频...")
+
+            if len(vlist) < page_size:
+                break
+
+            page += 1
+            time.sleep(0.5)
         except Exception as e:
-            print(f"获取第 {page} 页失败: {e}")
+            print(f"获取视频列表失败: {e}")
             break
 
+    return videos
+
+
+def get_video_playurl(bvid, quality, cookies=""):
+    """获取视频播放地址"""
+    # 先获取 cid
+    url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+    headers = HEADERS.copy()
+    if cookies:
+        headers["Cookie"] = cookies
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
+            data = json.loads(resp.read().decode())
         if data.get("code") != 0:
-            print(f"API 返回错误: {data.get('message', '未知错误')}")
-            print("提示: 若持续失败，可能需要登录 cookie，请使用 --cookies 参数")
-            break
+            return None
+        cid = data["data"]["cid"]
+        title = data["data"]["title"]
+    except Exception as e:
+        print(f"  获取视频信息失败: {e}")
+        return None
 
-        vlist = data.get("data", {}).get("list", {}).get("vlist", [])
-        if not vlist:
-            break
+    # 获取播放地址
+    qn_map = {"best": 127, "1080p": 80, "720p": 64, "480p": 32}
+    qn = qn_map.get(quality, 127)
 
-        for v in vlist:
-            bvids.append(v["bvid"])
+    url = f"https://api.bilibili.com/x/player/playurl?bvid={bvid}&cid={cid}&qn={qn}&fnval=16"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("code") != 0:
+            return None
 
-        total = data["data"]["page"]["count"]
-        fetched = (page - 1) * page_size + len(vlist)
-        print(f"  已获取 {fetched}/{total} 个视频")
+        durl = data["data"].get("durl")
+        dash = data["data"].get("dash")
 
-        if fetched >= total:
-            break
+        if dash:  # DASH 格式（音视频分离）
+            video_url = dash["video"][0]["baseUrl"] if dash.get("video") else None
+            audio_url = dash["audio"][0]["baseUrl"] if dash.get("audio") else None
+            return {"title": title, "video": video_url, "audio": audio_url, "type": "dash"}
+        elif durl:  # FLV 格式（音视频合一）
+            return {"title": title, "url": durl[0]["url"], "type": "flv"}
+    except Exception as e:
+        print(f"  获取播放地址失败: {e}")
 
-        page += 1
-        time.sleep(0.5)  # 避免请求过快
-
-    return bvids
+    return None
 
 
-def download_videos(bvids: list[str], output_dir: str, quality: str, cookies_file: str | None):
-    """使用 yt-dlp 下载视频列表"""
-    if not bvids:
-        print("没有找到可下载的视频")
-        return
+def download_file(url, output_path, cookies=""):
+    """下载文件"""
+    headers = HEADERS.copy()
+    if cookies:
+        headers["Cookie"] = cookies
 
-    os.makedirs(output_dir, exist_ok=True)
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
+            total_size = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            chunk_size = 1024 * 1024  # 1MB
 
-    quality_map = {
-        "best": "bestvideo+bestaudio/best",
-        "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "480p": "bestvideo[height<=480]+bestaudio/best[height<=480]",
-    }
-    format_str = quality_map.get(quality, quality_map["best"])
+            with open(output_path, "wb") as f:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        percent = downloaded * 100 / total_size
+                        print(f"\r    下载进度: {percent:.1f}%", end="", flush=True)
+            print()
+        return True
+    except Exception as e:
+        print(f"\n    下载失败: {e}")
+        return False
 
-    print(f"\n开始下载 {len(bvids)} 个视频到 {output_dir}")
-    print("-" * 50)
 
-    for i, bvid in enumerate(bvids, 1):
-        url = f"https://www.bilibili.com/video/{bvid}"
-        print(f"\n[{i}/{len(bvids)}] 下载: {url}")
+def merge_video_audio(video_path, audio_path, output_path):
+    """使用 ffmpeg 合并视频和音频"""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-c", "copy",
+        output_path,
+        "-loglevel", "error"
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    return result.returncode == 0
 
-        cmd = [
-            "yt-dlp",
-            url,
-            "--format", format_str,
-            "--output", os.path.join(output_dir, "%(title)s.%(ext)s"),
-            "--no-playlist",
-            "--retries", "3",
-            "--fragment-retries", "3",
-        ]
 
-        if cookies_file:
-            cmd += ["--cookies", cookies_file]
+def sanitize_filename(name):
+    """清理文件名中的非法字符"""
+    return re.sub(r'[\\/:*?"<>|]', "_", name)
 
-        result = subprocess.run(cmd)
-        if result.returncode != 0:
-            print(f"  警告: {bvid} 下载失败，继续下一个...")
 
-    print("\n全部完成！")
+def download_video(bvid, title, output_dir, quality, cookies):
+    """下载单个视频"""
+    safe_title = sanitize_filename(title)
+    output_path = os.path.join(output_dir, f"{safe_title}.mp4")
+
+    if os.path.exists(output_path):
+        print(f"  已存在，跳过: {safe_title}")
+        return True
+
+    play_info = get_video_playurl(bvid, quality, cookies)
+    if not play_info:
+        print(f"  无法获取播放地址，跳过")
+        return False
+
+    tmp_dir = os.path.join(output_dir, ".tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    if play_info["type"] == "dash":
+        video_path = os.path.join(tmp_dir, f"{bvid}_video.m4s")
+        audio_path = os.path.join(tmp_dir, f"{bvid}_audio.m4s")
+
+        print(f"  下载视频流...")
+        ok = download_file(play_info["video"], video_path, cookies)
+        if not ok:
+            return False
+
+        print(f"  下载音频流...")
+        ok = download_file(play_info["audio"], audio_path, cookies)
+        if not ok:
+            return False
+
+        print(f"  合并音视频...")
+        ok = merge_video_audio(video_path, audio_path, output_path)
+
+        os.remove(video_path)
+        os.remove(audio_path)
+
+        if not ok:
+            print(f"  合并失败")
+            return False
+
+    else:  # flv 格式直接下载
+        print(f"  下载视频...")
+        ok = download_file(play_info["url"], output_path, cookies)
+        if not ok:
+            return False
+
+    print(f"  完成: {safe_title}.mp4")
+    return True
 
 
 def main():
@@ -151,15 +270,10 @@ def main():
     )
     parser.add_argument("mid", help="UP 主的 UID（数字 ID）")
     parser.add_argument(
-        "--output", "-o",
-        default="./downloads",
-        help="下载目录（默认: ./downloads）",
-    )
-    parser.add_argument(
         "--quality", "-q",
         default="best",
         choices=["best", "1080p", "720p", "480p"],
-        help="视频画质（默认: best）",
+        help="视频画质（默认: best，即最高清晰度）",
     )
     parser.add_argument(
         "--cookies", "-c",
@@ -168,26 +282,54 @@ def main():
     )
 
     args = parser.parse_args()
+    check_ffmpeg()
 
-    check_yt_dlp()
+    cookies = load_cookies(args.cookies) if args.cookies else ""
+
+    # 输出目录：脚本目录下的 downloads/<UP主ID>
+    script_dir = Path(__file__).parent
+    output_dir = str(script_dir / "downloads" / args.mid)
 
     # 获取 UP 主信息
     info = get_user_info(args.mid)
     if info:
-        print(f"UP 主: {info.get('name', '未知')} (UID: {args.mid})")
+        up_name = info.get("name", "未知")
+        print(f"UP 主: {up_name} (UID: {args.mid})")
+        output_dir = str(script_dir / "downloads" / sanitize_filename(up_name))
     else:
         print(f"UID: {args.mid}（无法获取用户信息，继续下载）")
 
-    # 获取所有视频 BV 号
-    bvids = get_all_video_bvids(args.mid)
-    if not bvids:
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"下载目录: {output_dir}")
+    print(f"目标画质: {args.quality}")
+
+    # 获取所有视频
+    videos = get_all_videos(args.mid, cookies)
+    if not videos:
         print("未找到任何视频，退出")
         sys.exit(0)
 
-    print(f"\n共找到 {len(bvids)} 个视频")
+    print(f"\n共找到 {len(videos)} 个视频，开始下载...")
+    print("-" * 50)
 
-    # 下载
-    download_videos(bvids, args.output, args.quality, args.cookies)
+    success = 0
+    failed = 0
+    for i, video in enumerate(videos, 1):
+        bvid = video["bvid"]
+        title = video["title"]
+        print(f"\n[{i}/{len(videos)}] {title}")
+
+        ok = download_video(bvid, title, output_dir, args.quality, cookies)
+        if ok:
+            success += 1
+        else:
+            failed += 1
+
+        time.sleep(1)  # 避免请求过快
+
+    print("\n" + "=" * 50)
+    print(f"下载完成: 成功 {success} 个，失败 {failed} 个")
+    print(f"文件保存在: {output_dir}")
 
 
 if __name__ == "__main__":
