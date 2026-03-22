@@ -12,6 +12,7 @@ B站 UP 主视频批量下载脚本（纯 Python 实现）
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from functools import reduce
 from pathlib import Path
 
 # 跳过 SSL 证书验证
@@ -30,9 +32,43 @@ ssl_ctx.verify_mode = ssl.CERT_NONE
 
 # 请求头
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://www.bilibili.com",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Origin": "https://www.bilibili.com",
 }
+
+# WBI 签名混淆表
+_MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+]
+
+def _get_mixin_key(orig):
+    return reduce(lambda s, i: s + orig[i], _MIXIN_KEY_ENC_TAB, '')[:32]
+
+def get_wbi_key(cookies):
+    """从 nav 接口获取 WBI 签名所需的 mixin_key"""
+    headers = HEADERS.copy()
+    headers["Cookie"] = cookies
+    req = urllib.request.Request("https://api.bilibili.com/x/web-interface/nav", headers=headers)
+    with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
+        data = json.loads(resp.read().decode())
+    wbi = data["data"]["wbi_img"]
+    img_key = wbi["img_url"].split("/")[-1].split(".")[0]
+    sub_key = wbi["sub_url"].split("/")[-1].split(".")[0]
+    return _get_mixin_key(img_key + sub_key)
+
+def wbi_sign(params, mixin_key):
+    """对请求参数进行 WBI 签名"""
+    params["wts"] = int(time.time())
+    params = dict(sorted(params.items()))
+    query = "&".join(f"{k}={re.sub(r'[!()*]', '', str(v))}" for k, v in params.items())
+    params["w_rid"] = hashlib.md5((query + mixin_key).encode()).hexdigest()
+    return params
 
 
 def check_ffmpeg():
@@ -44,26 +80,36 @@ def check_ffmpeg():
 
 
 def load_cookies(cookies_file):
-    """加载 cookies 文件（Netscape 格式）"""
-    if not cookies_file or not os.path.exists(cookies_file):
+    """加载 cookies 文件（Netscape 格式）或直接返回 cookies 字符串"""
+    if not cookies_file:
         return ""
 
-    cookies = []
-    with open(cookies_file) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 7:
-                cookies.append(f"{parts[5]}={parts[6]}")
-    return "; ".join(cookies)
+    # 如果是文件路径
+    if os.path.exists(cookies_file):
+        cookies = []
+        with open(cookies_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    cookies.append(f"{parts[5]}={parts[6]}")
+        return "; ".join(cookies)
+
+    # 如果直接是 SESSDATA 值，构造 cookie 字符串
+    if not cookies_file.startswith("SESSDATA="):
+        cookies_file = f"SESSDATA={cookies_file}"
+
+    return cookies_file
 
 
 def get_user_info(mid):
     """获取 UP 主基本信息"""
-    url = f"https://api.bilibili.com/x/space/wbi/acc/info?mid={mid}"
-    req = urllib.request.Request(url, headers=HEADERS)
+    url = f"https://api.bilibili.com/x/space/acc/info?mid={mid}"
+    headers = HEADERS.copy()
+    headers["Referer"] = f"https://space.bilibili.com/{mid}"
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
             data = json.loads(resp.read().decode())
@@ -75,25 +121,36 @@ def get_user_info(mid):
 
 
 def get_all_videos(mid, cookies=""):
-    """获取 UP 主所有视频列表"""
+    """获取 UP 主所有视频列表（使用 WBI 签名）"""
     print(f"正在获取 UP 主 {mid} 的视频列表...")
+
+    # 获取 WBI 签名 key
+    try:
+        mixin_key = get_wbi_key(cookies)
+    except Exception as e:
+        print(f"  获取 WBI key 失败: {e}")
+        return []
 
     videos = []
     page = 1
     page_size = 30
-
     headers = HEADERS.copy()
+    headers["Referer"] = f"https://space.bilibili.com/{mid}/video"
     if cookies:
         headers["Cookie"] = cookies
 
     while True:
-        url = f"https://api.bilibili.com/x/space/wbi/arc/search?mid={mid}&pn={page}&ps={page_size}"
+        params = wbi_sign({"mid": mid, "ps": page_size, "pn": page, "order": "pubdate", "tid": 0}, mixin_key)
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        url = f"https://api.bilibili.com/x/space/wbi/arc/search?{query}"
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
                 data = json.loads(resp.read().decode())
 
-            if data.get("code") != 0:
+            code = data.get("code")
+            if code != 0:
+                print(f"  API 错误 ({code}): {data.get('message', '未知错误')}")
                 break
 
             vlist = data["data"]["list"]["vlist"]
@@ -101,15 +158,16 @@ def get_all_videos(mid, cookies=""):
                 break
 
             videos.extend(vlist)
-            print(f"  已获取 {len(videos)} 个视频...")
+            total = data["data"]["page"].get("count", 0)
+            print(f"  已获取 {len(videos)}/{total} 个视频...")
 
-            if len(vlist) < page_size:
+            if len(videos) >= total:
                 break
 
             page += 1
-            time.sleep(0.5)
+            time.sleep(1)
         except Exception as e:
-            print(f"获取视频列表失败: {e}")
+            print(f"  获取视频列表失败: {e}")
             break
 
     return videos
@@ -278,7 +336,13 @@ def main():
     parser.add_argument(
         "--cookies", "-c",
         default=None,
-        help="cookies 文件路径（Netscape 格式，用于需要登录的内容）",
+        help="cookies 文件路径（Netscape 格式）或直接传入 SESSDATA 值",
+    )
+    parser.add_argument(
+        "--wait",
+        type=int,
+        default=1,
+        help="请求间隔秒数（默认: 1，如遇限流可增加到 2-3）",
     )
 
     args = parser.parse_args()
