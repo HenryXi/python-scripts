@@ -3,12 +3,12 @@
 B站视频分集批量下载脚本（纯 Python 实现）
 
 用法:
-    python bilibili_video_downloader.py <BV号> [选项]
+    python bilibili_by_bvid.py <BV号> [选项]
 
 示例:
-    python bilibili_video_downloader.py BV1P7411C7Gz --cookies cookies.txt
-    python bilibili_video_downloader.py BV1P7411C7Gz --cookies cookies.txt --quality 1080p
-    python bilibili_video_downloader.py BV1P7411C7Gz --cookies cookies.txt --concurrency 5
+    python bilibili_by_bvid.py BV1P7411C7Gz --cookies cookies.txt
+    python bilibili_by_bvid.py BV1P7411C7Gz --cookies cookies.txt --quality 1080p
+    python bilibili_by_bvid.py BV1P7411C7Gz --cookies cookies.txt --concurrency 5
 """
 
 import argparse

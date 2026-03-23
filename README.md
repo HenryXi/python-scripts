@@ -89,5 +89,10 @@ python3 scripts/bilibili_by_bvid.py BV1P7411C7Gz --cookies cookies.txt --quality
 python-scripts/
 ├── .gitignore
 ├── README.md
-└── scripts/        # 所有脚本存放目录
+└── scripts/
+    ├── bilibili_by_uploader.py
+    ├── bilibili_by_bvid.py
+    └── downloads/          # 下载的视频（自动创建）
+        ├── <UP主用户名>/
+        └── <视频标题>/
 ```

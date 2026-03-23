@@ -3,12 +3,12 @@
 B站 UP 主视频批量下载脚本（纯 Python 实现）
 
 用法:
-    python bilibili_downloader.py <UP主UID> [选项]
+    python bilibili_by_uploader.py <UP主UID> [选项]
 
 示例:
-    python bilibili_downloader.py 12345678 --cookies cookies.txt
-    python bilibili_downloader.py 12345678 --cookies cookies.txt --quality 1080p
-    python bilibili_downloader.py 12345678 --cookies cookies.txt --concurrency 5
+    python bilibili_by_uploader.py 12345678 --cookies cookies.txt
+    python bilibili_by_uploader.py 12345678 --cookies cookies.txt --quality 1080p
+    python bilibili_by_uploader.py 12345678 --cookies cookies.txt --concurrency 5
 """
 
 import argparse
