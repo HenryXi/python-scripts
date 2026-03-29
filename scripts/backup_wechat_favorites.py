@@ -93,7 +93,7 @@ def rename_pic_files(directory):
 
 
 def remove_thumbnails(directory):
-    """步骤4: 智能删除缩略图（保留大文件或相似组中最大的）"""
+    """步骤4: 智能删除缩略图（保留文件大小最大的）"""
     image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
 
     images_info = []
@@ -122,14 +122,9 @@ def remove_thumbnails(directory):
     keep_files = set()
 
     for hash_val, images in groups.items():
-        if len(images) == 1:
-            # 单独的图片，如果大于500KB就保留
-            if images[0]['size_kb'] > 500:
-                keep_files.add(images[0]['file'])
-        else:
-            # 相似图片组，保留像素最大的
-            images.sort(key=lambda x: x['pixels'], reverse=True)
-            keep_files.add(images[0]['file'])
+        # 无论单独还是多张，都保留文件大小最大的
+        images.sort(key=lambda x: x['size_kb'], reverse=True)
+        keep_files.add(images[0]['file'])
 
     # 删除未标记保留的文件
     deleted = 0
